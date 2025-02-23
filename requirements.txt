@@ -12,4 +12,4 @@ typing_extensions==4.12.2
 wheel==0.45.1
 flask
 audiocraft
-
+psutil
