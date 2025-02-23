@@ -1,4 +1,4 @@
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, Response, stream_with_context
 from audiocraft.models import MusicGen
 from audiocraft.data.audio import audio_write
 import time
@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 import gc
 import logging
-import psutil
+import threading
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 logging.basicConfig(level=logging.INFO)
@@ -20,9 +20,10 @@ class Config:
     OUTPUT_DIR = Path("generated_music")
     MODEL_NAME = 'facebook/musicgen-small'
     DEFAULT_DURATION = 30
-    DEVICE = 'cpu'  # Default to CPU
-    OFFLOAD = True  # Whether to offload model between generations
-    USE_FP16 = True  # Enable half precision
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    OFFLOAD = True
+    USE_FP16 = True
+    CHUNK_SIZE = 8192
 
 Config.OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -30,55 +31,84 @@ class ModelManager:
     def __init__(self):
         self.model = None
         self.device = Config.DEVICE
+        self._loading = False
+        self._ready = False
+        self._loading_thread = None
+        # Start loading in background
+        self.start_loading()
+        
+    def start_loading(self):
+        def load_in_background():
+            try:
+                logger.info("Starting model load in background...")
+                self.load_model()
+                self._ready = True
+                logger.info("Model loaded and ready!")
+            except Exception as e:
+                logger.error(f"Error loading model: {e}")
+                self._ready = False
+                self._loading = False
+                
+        self._loading_thread = threading.Thread(target=load_in_background)
+        self._loading_thread.daemon = True
+        self._loading_thread.start()
         
     def load_model(self):
-        if self.model is None:
-            logger.info("Loading model...")
-            self.model = MusicGen.get_pretrained(Config.MODEL_NAME)
-            
-            if torch.cuda.is_available() and self.device == 'cuda':
-                self.model.to(self.device)
+        if self.model is None and not self._loading:
+            try:
+                self._loading = True
+                logger.info("Loading model...")
+                self.model = MusicGen.get_pretrained(Config.MODEL_NAME)
                 
-                # Convert to half precision if enabled
-                if Config.USE_FP16:
-                    logger.info("Converting model to FP16")
-                    self.model.half()  # Convert to FP16
-                    # Ensure the compression model stays in FP32
-                    if hasattr(self.model, 'compression_model'):
-                        self.model.compression_model.float()
-            
-            self.model.set_generation_params(
-                use_sampling=True,
-                temperature=1.0
-            )
+                if torch.cuda.is_available() and self.device == 'cuda':
+                    logger.info("Moving model to GPU...")
+                    self.model.to(self.device)
+                    
+                    if Config.USE_FP16:
+                        logger.info("Converting model to FP16")
+                        self.model.half()
+                        if hasattr(self.model, 'compression_model'):
+                            self.model.compression_model.float()
+                
+                self.model.set_generation_params(
+                    use_sampling=True,
+                    temperature=1.0
+                )
+                logger.info("Model loaded successfully")
+            finally:
+                self._loading = False
         return self.model
+
+    def is_ready(self):
+        return self._ready and self.model is not None
     
     def unload_model(self):
         if self.model is not None:
             self.model.cpu()
             if Config.USE_FP16:
-                self.model.float()  # Convert back to float32 before unloading
+                self.model.float()
             del self.model
             self.model = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
+            self._ready = False
             logger.info("Model unloaded")
 
     def generate(self, prompt, duration):
+        if not self.is_ready():
+            raise RuntimeError("Model is not ready yet")
+            
         try:
             model = self.load_model()
             model.set_generation_params(duration=duration)
             
-            # Generate in inference mode to save memory
             with torch.inference_mode():
                 if Config.USE_FP16 and torch.cuda.is_available():
-                    # Ensure input is in FP16 if model is in FP16
                     audio = model.generate([prompt])
                 else:
                     audio = model.generate([prompt])
             
-            # Convert back to float32 for audio processing
             audio = audio.float()
             
             if Config.OFFLOAD:
@@ -92,96 +122,32 @@ class ModelManager:
                 self.unload_model()
             raise
 
+# Initialize model manager globally
+logger.info("Initializing ModelManager...")
 model_manager = ModelManager()
 
-def clean_memory():
-    """Aggressive memory cleaning"""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-    
-def get_memory_usage():
-    """Get current memory usage"""
-    memory_info = {
-        'ram_percent': psutil.Process(os.getpid()).memory_percent(),
-        'ram_used_mb': psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-    }
-    if torch.cuda.is_available():
-        memory_info['gpu_allocated_mb'] = torch.cuda.memory_allocated() / 1024 / 1024
-        memory_info['gpu_cached_mb'] = torch.cuda.memory_reserved() / 1024 / 1024
-    return memory_info
-
-@app.route('/generate-music', methods=['POST'])
-def generate_music():
-    try:
-        data = request.get_json()
-        if not data or 'prompt' not in data:
-            return jsonify({'error': 'No prompt provided'}), 400
-        
-        prompt = data['prompt']
-        duration = data.get('duration', Config.DEFAULT_DURATION)
-        
-        # Clean memory before generation
-        clean_memory()
-        
-        # Generate unique filename
-        timestamp = int(time.time())
-        output_path = Config.OUTPUT_DIR / f"generated_music_{timestamp}.wav"
-        
-        # Generate audio
-        start_time = time.time()
-        audio = model_manager.generate(prompt, duration)
-        
-        # Move to CPU and save
-        audio = audio.cpu()
-        audio_write(
-            str(output_path),
-            audio.squeeze(0),
-            model_manager.load_model().sample_rate,
-            strategy="loudness"
-        )
-        
-        # Clean up memory after generation
-        clean_memory()
-        
-        generation_time = time.time() - start_time
-        logger.info(f"Generation took {generation_time:.2f} seconds")
-        
-        return send_file(
-            output_path,
-            mimetype="audio/wav",
-            as_attachment=True,
-            download_name=output_path.name
-        )
-        
-    except Exception as e:
-        logger.error(f"Error: {str(e)}")
+@app.route('/ready', methods=['GET'])
+def ready_check():
+    """Endpoint for checking if the model is loaded and ready"""
+    if model_manager.is_ready():
+        return jsonify({'status': 'ready', 'message': 'Model is loaded and ready'})
+    else:
         return jsonify({
-            'error': str(e),
-            'message': 'An error occurred during music generation'
-        }), 500
+            'status': 'loading',
+            'message': 'Model is still loading'
+        }), 503  # Service Unavailable
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    memory_info = get_memory_usage()
+    """Basic health check that doesn't depend on model loading"""
     return jsonify({
         'status': 'healthy',
-        'model_loaded': model_manager.model is not None,
-        'memory_info': memory_info,
-        'fp16_enabled': Config.USE_FP16,
+        'model_status': 'ready' if model_manager.is_ready() else 'loading',
         'device': Config.DEVICE
     })
 
-@app.route('/cleanup', methods=['POST'])
-def cleanup():
-    """Endpoint to force memory cleanup"""
-    model_manager.unload_model()
-    clean_memory()
-    return jsonify({'status': 'cleanup completed', 'memory_info': get_memory_usage()})
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    # Initialize on CPU by default
-    Config.DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    port = int(os.environ.get('PORT', 10000))
+    logger.info(f"Starting server on port {port}...")
     app.run(host='0.0.0.0', port=port)
