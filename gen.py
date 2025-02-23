@@ -24,7 +24,7 @@ def generate_music():
             return jsonify({'error': 'No prompt provided'}), 400
         
         prompt = data['prompt']
-        duration = data.get('duration', 10)  # Default 10 seconds if not specified
+        duration = data.get('duration', 30)  # Default 10 seconds if not specified
         
         # Generate unique filename
         timestamp = int(time.time())
